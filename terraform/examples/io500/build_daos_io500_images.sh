@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2022 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #
 # Build daos-server and daos-client images.
 # The daos-client image will have IO500 pre-installed.
@@ -26,7 +40,7 @@ INSTALL_SCRIPTS=(
 install_devtools.sh
 install_intel-oneapi.sh
 install_mpifileutils.sh
-install_io500-sc21.sh
+install_io500-isc22.sh
 )
 
 # Reverse the INSTALL_SCRIPTS array
@@ -38,6 +52,8 @@ done
 
 IMAGES_DIR="${SCRIPT_DIR}/../../../images"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
+BUILD_WORKER_POOL="${BUILD_WORKER_POOL:-""}"
+USE_IAP="${USE_IAP:-"true"}"
 ERROR_MSGS=()
 
 show_help() {
@@ -70,6 +86,15 @@ Options:
                                This is the URL up to the version.
                                If the repo is at https://example.com/foo/v${DAOS_VERSION}
                                then -u "https://example.com/foo"
+
+
+    -w --worker-pool BUILD_WORKER_POOL
+                               Specify a worker pool for the build to run in.
+                               Format: projects/{project}/locations/
+                                        {region}/workerPools/{workerPool}
+    
+    -i --use-iap  USE_IAP      Whether to use an IAP proxy for Packer.
+                               Possible values: true, false. Default: true.
 
     -f --force                 Force images to be built if there are already
                                existing images
@@ -168,8 +193,8 @@ create_tmp_dir() {
   cp -r "${IMAGES_DIR}" "${TMP_DIR}/"
   TMP_IMAGES_DIR="${TMP_DIR}/$(basename "${IMAGES_DIR}")"
   TMP_SCRIPTS_DIR="${TMP_IMAGES_DIR}/scripts"
-  TMP_CLIENT_PACKER_FILE="${TMP_IMAGES_DIR}/daos-client-image.json"
-  TMP_SERVER_PACKER_FILE="${TMP_IMAGES_DIR}/daos-server-image.json"
+  TMP_CLIENT_PACKER_FILE="${TMP_IMAGES_DIR}/daos-client-image.pkr.hcl"
+  TMP_SERVER_PACKER_FILE="${TMP_IMAGES_DIR}/daos-server-image.pkr.hcl"
 }
 
 cleanup() {
@@ -184,7 +209,7 @@ add_script() {
   script_name="$1"
   comma="$2"
   if ! grep -q "${script_name}" "${TMP_CLIENT_PACKER_FILE}"; then
-    sed -i "\|\"./scripts/install_daos.sh\",$|a \\        \"./scripts/${script_name}\"${comma}" "${TMP_CLIENT_PACKER_FILE}"
+    sed -i "\|\"./scripts/install_daos.sh\",$|a \\      \"./scripts/${script_name}\"${comma}" "${TMP_CLIENT_PACKER_FILE}"
   fi
 }
 
@@ -301,6 +326,22 @@ opts() {
         fi
         shift 2
       ;;
+      --worker-pool|-w)
+        BUILD_WORKER_POOL="${2}"
+        if [[ "${BUILD_WORKER_POOL}" == -* ]] || [[ "${BUILD_WORKER_POOL}" = "" ]] || [[ -z ${BUILD_WORKER_POOL} ]]; then
+          ERROR_MSGS+=("ERROR: Missing BUILD_WORKER_POOL value for -w or --worker-pool")
+          break
+        fi
+        shift 2
+      ;;
+      --use-iap|-i)
+        USE_IAP="${2}"
+        if [[ "${USE_IAP}" == -* ]] || [[ "${USE_IAP}" = "" ]] || [[ -z ${USE_IAP} ]]; then
+          ERROR_MSGS+=("ERROR: Missing USE_IAP value for -i or --use-iap")
+          break
+        fi
+        shift 2
+      ;;
       --force|-f)
         FORCE_REBUILD=1
         shift
@@ -355,6 +396,8 @@ opts() {
   export GCP_ZONE
   export DAOS_INSTALL_TYPE
   export FORCE_REBUILD
+  export BUILD_WORKER_POOL
+  export USE_IAP
 }
 
 main() {

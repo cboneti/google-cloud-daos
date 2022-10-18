@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2022 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #
 # Build DAOS server and client images using Packer in Google Cloud Build
 #
@@ -16,6 +30,8 @@ source "${SCRIPT_DIR}/daos_version.sh"
 DAOS_VERSION="${DAOS_VERSION:-${DEFAULT_DAOS_VERSION}}"
 DAOS_REPO_BASE_URL="${DAOS_REPO_BASE_URL:-${DEFAULT_DAOS_REPO_BASE_URL}}"
 FORCE_REBUILD=0
+USE_IAP="${USE_IAP:-"true"}"
+BUILD_WORKER_POOL="${BUILD_WORKER_POOL:-""}"
 ERROR_MSGS=()
 
 show_help() {
@@ -41,6 +57,13 @@ Options:
 
   [ -z --zone         GCP_ZONE    ]        Google Cloud Platform Compute Zone
                                            Default: Cloud SDK default zone
+
+  [ -w --worker-pool BUILD_WORKER_POOL ]   Specify a worker pool for the build to run in.
+                                           Format: projects/{project}/locations/
+                                                    {region}/workerPools/{workerPool}
+
+  [ -i --use-iap     USE_IAP    ]          Whether to use an IAP proxy for Packer.
+                                           Possible values: true, false. Default: true.
 
   [ -h --help ]                     Show help
 
@@ -176,6 +199,22 @@ opts() {
         FORCE_REBUILD=1
         shift
       ;;
+      --worker-pool|-w)
+        BUILD_WORKER_POOL="${2}"
+        if [[ "${BUILD_WORKER_POOL}" == -* ]] || [[ "${BUILD_WORKER_POOL}" = "" ]] || [[ -z ${BUILD_WORKER_POOL} ]]; then
+          ERROR_MSGS+=("ERROR: Missing BUILD_WORKER_POOL value for -w or --worker-pool")
+          break
+        fi
+        shift 2
+      ;;
+      --use-iap|-i)
+        USE_IAP="${2}"
+        if [[ "${USE_IAP}" == -* ]] || [[ "${USE_IAP}" = "" ]] || [[ -z ${USE_IAP} ]]; then
+          ERROR_MSGS+=("ERROR: Missing USE_IAP value for -i or --use-iap")
+          break
+        fi
+        shift 2
+      ;;
       --help|-h)
         show_help
         exit 0
@@ -242,55 +281,79 @@ configure_gcp_project() {
   log "Packer will be using service account ${CLOUD_BUILD_ACCOUNT}"
 
   # Add cloudbuild SA permissions
-  gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
-    --member "${CLOUD_BUILD_ACCOUNT}" \
-    --role roles/compute.instanceAdmin.v1
-
-  gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
-    --member "${CLOUD_BUILD_ACCOUNT}" \
-    --role roles/iam.serviceAccountUser
-
-  FWRULENAME="gcp-cloudbuild-ssh"
-
-  # Check if we have an ssh firewall rule for cloudbuild in place already
-  FWLIST=$(gcloud compute --project="${GCP_PROJECT}" \
-    firewall-rules list \
-    --filter name="${FWRULENAME}" \
-    --sort-by priority \
-    --format='value(name)')
-
-  if [[ -z ${FWLIST} ]]; then
-    # Setup firewall rule to allow ssh from clould build.
-    # FIXME: Needs to be fixed to restric to IP range
-    # for clound build only once we know what that is.
-    log "Setting up firewall rule for ssh and clouldbuild"
-    gcloud compute --project="${GCP_PROJECT}" firewall-rules create "${FWRULENAME}" \
-    --direction=INGRESS --priority=1000 --network=default --action=ALLOW \
-    --rules=tcp:22 --source-ranges=0.0.0.0/0
-  else
-    log "Firewall rule for ssh and cloud build already in place."
+  CHECK_ROLE_INST_ADMIN=$(
+    gcloud projects get-iam-policy "${GCP_PROJECT}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.role=roles/compute.instanceAdmin.v1 AND \
+              bindings.members=${CLOUD_BUILD_ACCOUNT}" \
+    --format="value(bindings.members[])"
+  )
+  if [[ "${CHECK_ROLE_INST_ADMIN}" != "${CLOUD_BUILD_ACCOUNT}" ]]; then
+    gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+      --member "${CLOUD_BUILD_ACCOUNT}" \
+      --role roles/compute.instanceAdmin.v1
   fi
+
+  CHECK_ROLE_SVC_ACCT=$(
+    gcloud projects get-iam-policy "${GCP_PROJECT}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.role=roles/iam.serviceAccountUser AND \
+              bindings.members=${CLOUD_BUILD_ACCOUNT}" \
+    --format="value(bindings.members[])"
+  )
+  if [[ "${CHECK_ROLE_SVC_ACCT}" != "${CLOUD_BUILD_ACCOUNT}" ]]; then
+    gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+      --member "${CLOUD_BUILD_ACCOUNT}" \
+      --role roles/iam.serviceAccountUser
+  fi
+
+  CHECK_ROLE_IAP_TUNL_RESR_ACCS=$(
+    gcloud projects get-iam-policy "${GCP_PROJECT}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.role=roles/iap.tunnelResourceAccessor AND \
+              bindings.members=${CLOUD_BUILD_ACCOUNT}" \
+    --format="value(bindings.members[])"
+  )
+  if [[ "${CHECK_ROLE_IAP_TUNL_RESR_ACCS}" != "${CLOUD_BUILD_ACCOUNT}" ]]; then
+    gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+      --member "${CLOUD_BUILD_ACCOUNT}" \
+      --role roles/iap.tunnelResourceAccessor
+  fi
+
 }
 
 build_images() {
+  BUILD_OPTIONAL_ARGS=""
+
+  if [[ ${BUILD_WORKER_POOL} ]]; then
+    # When worker pool is specified then region needs to match the one of the pool.
+    # Need to parse the correct region to use it instead of the default one "global".
+    # Format: projects/{project}/locations/{region}/workerPools/{workerPool}
+    BUILD_WORKER_POOL_ARRAY=(${BUILD_WORKER_POOL//// })
+    BUILD_REGION=${BUILD_WORKER_POOL_ARRAY[3]}
+    BUILD_OPTIONAL_ARGS+=" --worker-pool=${BUILD_WORKER_POOL}"
+
+    log "Using build worker pool ${BUILD_WORKER_POOL}, region ${BUILD_REGION}"
+  fi
+
+  if [[ ${BUILD_REGION} ]] ; then
+    BUILD_OPTIONAL_ARGS+=" --region=${BUILD_REGION}"
+  fi
+
   # Increase timeout to 1hr to make sure we don't time out
   if [[ "${DAOS_INSTALL_TYPE}" =~ ^(all|server)$ ]]; then
     log "Building server image"
     gcloud builds submit --timeout=1800s \
-    --substitutions="_PROJECT_ID=${GCP_PROJECT},_ZONE=${GCP_ZONE},_DAOS_VERSION=${DAOS_VERSION},_DAOS_REPO_BASE_URL=${DAOS_REPO_BASE_URL}" \
-    --config=packer_cloudbuild-server.yaml .
+    --substitutions="_PROJECT_ID=${GCP_PROJECT},_ZONE=${GCP_ZONE},_DAOS_VERSION=${DAOS_VERSION},_DAOS_REPO_BASE_URL=${DAOS_REPO_BASE_URL},_USE_IAP=${USE_IAP}" \
+    --config=packer_cloudbuild-server.yaml $BUILD_OPTIONAL_ARGS .
   fi
 
   if [[ "${DAOS_INSTALL_TYPE}" =~ ^(all|client)$ ]]; then
     log "Building client image"
     gcloud builds submit --timeout=1800s \
-    --substitutions="_PROJECT_ID=${GCP_PROJECT},_ZONE=${GCP_ZONE},_DAOS_VERSION=${DAOS_VERSION},_DAOS_REPO_BASE_URL=${DAOS_REPO_BASE_URL}" \
-    --config=packer_cloudbuild-client.yaml .
+    --substitutions="_PROJECT_ID=${GCP_PROJECT},_ZONE=${GCP_ZONE},_DAOS_VERSION=${DAOS_VERSION},_DAOS_REPO_BASE_URL=${DAOS_REPO_BASE_URL},_USE_IAP=${USE_IAP}" \
+    --config=packer_cloudbuild-client.yaml $BUILD_OPTIONAL_ARGS .
   fi
-}
-
-remove_firewall() {
-  gcloud -q compute --project="${GCP_PROJECT}" firewall-rules delete "${FWRULENAME}"
 }
 
 list_images() {
@@ -308,9 +371,7 @@ main() {
   log_section "Building DAOS Image(s)"
   configure_gcp_project
   build_images
-  remove_firewall
   list_images
 }
 
 main "$@"
-

@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2022 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #
 # Runs Terraform to create DAOS Server and Client instances.
 # Copies necessary files to clients to allow the IO500 benchmark to be run.
@@ -33,6 +47,9 @@ ACTIVE_CONFIG="${CONFIG_DIR}/active_config.sh"
 # bastion host for the IO500 example.
 SSH_CONFIG_FILE="${IO500_TMP}/ssh_config"
 
+# Use internal IP for SSH connection with the first daos client
+USE_INTERNAL_IP=0
+
 ERROR_MSGS=()
 
 
@@ -55,6 +72,8 @@ Options:
   [ -v --version  DAOS_VERSION ]  Version of DAOS to install
 
   [ -u --repo-baseurl DAOS_REPO_BASE_URL ] Base URL of a repo.
+
+  [ -i --internal-ip ]            Use internal IP for SSH to the first client
 
   [ -f --force ]                  Force images to be re-built
 
@@ -137,6 +156,10 @@ opts() {
         fi
         export CONFIG_FILE
         shift 2
+      ;;
+      --internal-ip|-i)
+        USE_INTERNAL_IP=1
+        shift
       ;;
       --version|-v)
         DAOS_VERSION="${2}"
@@ -276,14 +299,14 @@ build_disk_images() {
 
 run_terraform() {
   log_section "Deploying DAOS Servers and Clients using Terraform"
-  pushd ../full_cluster_setup
+  pushd ../daos_cluster
   terraform init -input=false
   terraform plan -out=tfplan -input=false
   terraform apply -input=false tfplan
   popd
 }
 
-configure_first_client_nat_ip() {
+configure_first_client_ip() {
 
   log "Wait for DAOS client instances"
   gcloud compute instance-groups managed wait-until ${TF_VAR_client_template_name} \
@@ -291,25 +314,32 @@ configure_first_client_nat_ip() {
     --project="${TF_VAR_project_id}" \
     --zone="${TF_VAR_zone}"
 
-  # Check to see if first client instance has an external IP.
-  # If it does, then don't attempt to add an external IP again.
-  FIRST_CLIENT_IP=$(gcloud compute instances describe "${DAOS_FIRST_CLIENT}" \
-    --project="${TF_VAR_project_id}" \
-    --zone="${TF_VAR_zone}" \
-    --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-
-  if [[ -z "${FIRST_CLIENT_IP}" ]]; then
-    log "Add external IP to first client"
-
-    gcloud compute instances add-access-config "${DAOS_FIRST_CLIENT}" \
+  if [[ "${USE_INTERNAL_IP}" -eq 1 ]]; then
+    FIRST_CLIENT_IP=$(gcloud compute instances describe "${DAOS_FIRST_CLIENT}" \
       --project="${TF_VAR_project_id}" \
       --zone="${TF_VAR_zone}" \
-      && sleep 10
-
+      --format="value(networkInterfaces[0].networkIP)")
+  else
+    # Check to see if first client instance has an external IP.
+    # If it does, then don't attempt to add an external IP again.
     FIRST_CLIENT_IP=$(gcloud compute instances describe "${DAOS_FIRST_CLIENT}" \
       --project="${TF_VAR_project_id}" \
       --zone="${TF_VAR_zone}" \
       --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+
+    if [[ -z "${FIRST_CLIENT_IP}" ]]; then
+      log "Add external IP to first client"
+
+      gcloud compute instances add-access-config "${DAOS_FIRST_CLIENT}" \
+        --project="${TF_VAR_project_id}" \
+        --zone="${TF_VAR_zone}" \
+        && sleep 10
+
+      FIRST_CLIENT_IP=$(gcloud compute instances describe "${DAOS_FIRST_CLIENT}" \
+        --project="${TF_VAR_project_id}" \
+        --zone="${TF_VAR_zone}" \
+        --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+    fi
   fi
 }
 
@@ -416,6 +446,9 @@ EOF
   ssh -q -F "${SSH_CONFIG_FILE}" "${FIRST_CLIENT_IP}" \
     "chmod -R 600 ~/.ssh/*"
 
+  echo "#!/bin/bash
+  ssh -F ./tmp/ssh_config ${FIRST_CLIENT_IP}" > "${SCRIPT_DIR}/login"
+  chmod +x "${SCRIPT_DIR}/login"
 }
 
 copy_files_to_first_client() {
@@ -433,9 +466,9 @@ copy_files_to_first_client() {
     "${HOSTS_CLIENTS_FILE}" \
     "${HOSTS_SERVERS_FILE}" \
     "${HOSTS_ALL_FILE}" \
-    ${SCRIPT_DIR}/configure_daos.sh \
     ${SCRIPT_DIR}/clean_storage.sh \
-    ${SCRIPT_DIR}/run_io500-sc21.sh \
+    ${SCRIPT_DIR}/run_io500-isc22.sh \
+    ${SCRIPT_DIR}/io500-isc22.config-template.daos-rf0.ini \
     "${FIRST_CLIENT_IP}:~/"
 
   ssh -q -F "${SSH_CONFIG_FILE}" ${FIRST_CLIENT_IP} \
@@ -453,9 +486,26 @@ propagate_ssh_keys_to_all_nodes () {
     "clush --hostfile=hosts_all --dsh --copy ~/.ssh --dest ~/"
 }
 
-configure_daos() {
-  log "Configure DAOS instances"
-  ssh -q -F "${SSH_CONFIG_FILE}" ${FIRST_CLIENT_IP} "~/configure_daos.sh"
+wait_for_startup_script_to_finish () {
+  ssh -q -F "${SSH_CONFIG_FILE}" "${FIRST_CLIENT_IP}" \
+    "printf 'Waiting for startup script to finish\n'
+     until sudo journalctl -u google-startup-scripts.service --no-pager | grep 'Finished running startup scripts.'
+     do
+       printf '.'
+       sleep 5
+     done
+     printf '\n'
+    "
+}
+
+set_permissions_on_cert_files () {
+  if [[ "${DAOS_ALLOW_INSECURE}" == "false" ]]; then
+    ssh -q -F "${SSH_CONFIG_FILE}" "${FIRST_CLIENT_IP}" \
+      "clush --hostfile=hosts_clients --dsh sudo chown ${SSH_USER}:${SSH_USER} /etc/daos/certs/daosCA.crt"
+
+    ssh -q -F "${SSH_CONFIG_FILE}" "${FIRST_CLIENT_IP}" \
+      "clush --hostfile=hosts_clients --dsh sudo chown ${SSH_USER}:${SSH_USER} /etc/daos/certs/admin.*"
+  fi
 }
 
 show_instances() {
@@ -467,6 +517,16 @@ show_instances() {
     --filter="name~'^${DAOS_FILTER}'"
 }
 
+check_gvnic() {
+  DAOS_SERVER_NETWORK_TYPE=$(ssh -q -F "${SSH_CONFIG_FILE}" ${FIRST_CLIENT_IP} "ssh ${DAOS_FIRST_SERVER} 'sudo lshw -class network'" | sed -n "s/^.*product: \(.*\$\)/\1/p")
+  DAOS_CLIENT_NETWORK_TYPE=$(ssh -q -F "${SSH_CONFIG_FILE}" ${FIRST_CLIENT_IP} "sudo lshw -class network" | sed -n "s/^.*product: \(.*\$\)/\1/p")
+
+  log_section "Network adapters type:"
+  printf '%s\n%s\n' \
+    "DAOS_SERVER_NETWORK_TYPE = ${DAOS_SERVER_NETWORK_TYPE}" \
+    "DAOS_CLIENT_NETWORK_TYPE = ${DAOS_CLIENT_NETWORK_TYPE}"
+}
+
 show_run_steps() {
 
  log_section "DAOS Server and Client instances are ready for IO500 run"
@@ -476,10 +536,10 @@ show_run_steps() {
 To run the IO500 benchmark:
 
 1. Log into the first client
-   ssh -F ./tmp/ssh_config ${FIRST_CLIENT_IP}
+   ./login
 
 2. Run IO500
-   ~/run_io500-sc21.sh
+   ./run_io500-isc22.sh
 
 EOF
 }
@@ -492,11 +552,14 @@ main() {
   create_hosts_files
   build_disk_images
   run_terraform
-  configure_first_client_nat_ip
+  configure_first_client_ip
   configure_ssh
   copy_files_to_first_client
   propagate_ssh_keys_to_all_nodes
+  wait_for_startup_script_to_finish
+  set_permissions_on_cert_files
   show_instances
+  check_gvnic
   show_run_steps
 }
 
